@@ -7,6 +7,7 @@ from torch import nn
 
 import rtp_llm.ops.compute_ops as compute_ops
 from rtp_llm.config.model_config import ModelConfig
+from rtp_llm.device.device_type import DeviceType, get_device_type
 from rtp_llm.model_loader.model_weight_info import ModelWeights
 from rtp_llm.models_py.distributed.collective_torch import Group, all_gather, all_reduce
 from rtp_llm.models_py.model_desc.block_map import select_block_map_for_layer
@@ -21,22 +22,6 @@ from rtp_llm.models_py.modules import (
     RMSNorm,
 )
 from rtp_llm.models_py.modules.base.common.kvcache_store import WriteCacheStoreOp
-from rtp_llm.models_py.triton_kernels.causal_conv1d import (
-    CausalConv1dMetadata,
-    causal_conv1d_fn,
-    causal_conv1d_update,
-    prepare_causal_conv1d_metadata,
-)
-from rtp_llm.models_py.triton_kernels.common.layernorm_gated import RmsNormGated
-from rtp_llm.models_py.triton_kernels.fla.block import (
-    load_initial_state_from_block_map,
-    store_ssm_state_to_block_map,
-)
-from rtp_llm.models_py.triton_kernels.fla.chunk import chunk_gated_delta_rule
-from rtp_llm.models_py.triton_kernels.fla.fused_recurrent import (
-    fused_recurrent_gated_delta_rule,
-)
-from rtp_llm.models_py.triton_kernels.fla.gdn_gating import fused_gdn_gating
 from rtp_llm.models_py.utils.debug import cudagraph_debug_kernel
 from rtp_llm.models_py.utils.typed_storage_view import LinearCacheConverter
 from rtp_llm.ops import (
@@ -53,6 +38,37 @@ from rtp_llm.ops.compute_ops import (
 )
 from rtp_llm.utils.model_weight import W
 from rtp_llm.utils.util import to_torch_dtype
+
+if get_device_type() == DeviceType.Ascend:
+    from rtp_llm.models_py.kernels.ascend import (
+        CausalConv1dMetadata,
+        RmsNormGated,
+        causal_conv1d_fn,
+        causal_conv1d_update,
+        chunk_gated_delta_rule,
+        fused_gdn_gating,
+        fused_recurrent_gated_delta_rule,
+        load_initial_state_from_block_map,
+        prepare_causal_conv1d_metadata,
+        store_ssm_state_to_block_map,
+    )
+else:
+    from rtp_llm.models_py.triton_kernels.causal_conv1d import (
+        CausalConv1dMetadata,
+        causal_conv1d_fn,
+        causal_conv1d_update,
+        prepare_causal_conv1d_metadata,
+    )
+    from rtp_llm.models_py.triton_kernels.common.layernorm_gated import RmsNormGated
+    from rtp_llm.models_py.triton_kernels.fla.block import (
+        load_initial_state_from_block_map,
+        store_ssm_state_to_block_map,
+    )
+    from rtp_llm.models_py.triton_kernels.fla.chunk import chunk_gated_delta_rule
+    from rtp_llm.models_py.triton_kernels.fla.fused_recurrent import (
+        fused_recurrent_gated_delta_rule,
+    )
+    from rtp_llm.models_py.triton_kernels.fla.gdn_gating import fused_gdn_gating
 
 
 class Qwen3NextMetadata(object):
@@ -458,9 +474,15 @@ class Qwen3NextAttention(CausalAttention):
         weights: Dict[str, torch.Tensor],
         layernorm_eps: float,
         quant_config: Optional[object] = None,
+        layer_idx: int = 0,
     ):
         super().__init__(
-            attn_config, parallelism_config, weights, layernorm_eps, quant_config
+            attn_config,
+            parallelism_config,
+            weights,
+            layernorm_eps,
+            quant_config,
+            layer_idx=layer_idx,
         )
         # maybe fuse gate in qkv_proj later
         self.gate = LinearFactory.create_linear_from_weights(
@@ -767,12 +789,15 @@ class Qwen3NextDecoderLayer(nn.Module):
             attn_configs = config.getAttentionConfigs(
                 parallelism_config.get_attn_tp_size()
             )
+            # layer_idx must reach CausalAttention: hybrid models pick the KV
+            # cache group (and thus the block table / slot mapping) by layer.
             self.self_attn = Qwen3NextAttention(
                 attn_configs,
                 parallelism_config,
                 weights,
                 config.layernorm_eps,
                 config.quant_config,
+                layer_idx=layer_idx,
             )
 
         if config.moe_style == 2:

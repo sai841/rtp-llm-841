@@ -4,6 +4,8 @@ import torch_npu
 from rtp_llm.models_py.modules.factory.attention.ascend_impl.ascend_attn_params import (
     AscendAttnParams,
     compute_ascend_attn_params,
+    infer_blocks_per_phys,
+    split_kv_kernel_blocks,
 )
 from rtp_llm.models_py.modules.factory.attention.ascend_impl.ascend_kv_cache_write_op import AscendKVCacheWriteOp
 from rtp_llm.models_py.modules.factory.attention.ascend_impl.ascend_rope_emb import AscendRotaryEmbeddingOp
@@ -60,8 +62,15 @@ class AscendPrefillImpl(FMHAImplBase):
         value = v.reshape(v.shape[0], num_kv_heads, head_dim).contiguous()
         return query, key, value
 
-    def _update_rope_kv_write_params(self, device):
-        positions, slot_mapping = compute_ascend_attn_params(self.attn_inputs)
+    def _update_rope_kv_write_params(self, device, kv_cache, layer_idx: int = 0):
+        # The kernel block granularity comes from the per-layer cache view; the
+        # physical block size it maps onto drives slot_mapping and the writes.
+        blocks_per_phys = infer_blocks_per_phys(self.attn_inputs)
+        kernel_page = kv_cache.seq_size_per_block if kv_cache is not None else 0
+        self.params.blocks_per_phys = blocks_per_phys
+        positions, slot_mapping = compute_ascend_attn_params(
+            self.attn_inputs, layer_idx, kernel_page * blocks_per_phys
+        )
         self.params.positions_d = positions.to(device, non_blocking=True)
         self.params.slot_mapping = slot_mapping.to(device, non_blocking=True)
 
@@ -72,7 +81,7 @@ class AscendPrefillImpl(FMHAImplBase):
 
     def forward(self, qkv, kv_cache, layer_idx=0):
         if self.need_rope_kv_cache:
-            self._update_rope_kv_write_params(qkv.device)
+            self._update_rope_kv_write_params(qkv.device, kv_cache, layer_idx)
 
             if self.rope_impl is not None:
                 query, key, value = self.rope_impl.forward(qkv)
@@ -119,12 +128,14 @@ class AscendPrefillAttnOp:
         self.block_table = None
         self.actual_seq_q = None
         self.actual_seq_kv = None
+        self.blocks_per_phys = 1
 
     def set_params(self, params):
         self.params = params
 
     def prepare(self, attn_inputs):
         self.block_table = attn_inputs.kv_cache_kernel_block_id_host
+        self.blocks_per_phys = infer_blocks_per_phys(attn_inputs)
         if self.block_table is not None:
             self.block_table = self.block_table.clamp(min=0)
             if self.block_table.ndim != 2:
@@ -136,12 +147,10 @@ class AscendPrefillAttnOp:
         self.actual_seq_kv = seq_lens_kv
 
     def forward(self, q, kv_cache):
-        # kv_cache_base is BSND [blocks, seq, heads, dim] from C++ reshape.
-        # FIA v2 page attention supports 3D cache (blocknum, blocksize, H).
-        k_cache = kv_cache.kv_cache_base[:, 0].reshape(
-            kv_cache.kv_cache_base.shape[0], self.page_size, -1)
-        v_cache = kv_cache.kv_cache_base[:, 1].reshape(
-            kv_cache.kv_cache_base.shape[0], self.page_size, -1)
+        # The per-layer view is at kernel-block granularity, which interleaves
+        # K and V once a physical block is subdivided; split them explicitly.
+        k_cache, v_cache, page_size = split_kv_kernel_blocks(
+            kv_cache, self.blocks_per_phys)
         block_table = self.block_table
         if block_table is not None and block_table.device.type != q.device.type:
             block_table = block_table.to(q.device)
@@ -157,7 +166,7 @@ class AscendPrefillAttnOp:
             atten_mask=atten_mask,
             block_table=block_table,
             input_layout="TND",
-            block_size=self.page_size,
+            block_size=page_size,
             actual_seq_qlen=actual_seq_q,
             actual_seq_kvlen=actual_seq_kv,
             num_key_value_heads=self.num_kv_heads,

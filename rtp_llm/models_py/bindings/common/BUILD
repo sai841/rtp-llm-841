@@ -31,6 +31,21 @@ cc_library(
 )
 
 cc_library(
+    name = "write_cache_store_op",
+    srcs = ["WriteCacheStoreOp.cc"],
+    hdrs = ["WriteCacheStoreOp.h"],
+    deps = [
+        "//rtp_llm/models_py/bindings:op_defs",
+        "//rtp_llm/models_py/bindings/core:op_data",
+        "//rtp_llm/models_py/bindings/core:exec_ops_hdr",
+        "//rtp_llm/models_py/bindings/core:cache_store_async_writer",
+    ] + torch_deps(),
+    visibility = ["//visibility:public"],
+    copts = copts(),
+    alwayslink = 1,
+)
+
+cc_library(
     name = "common",
     srcs = glob(["*.cc"], exclude = ["FusedCopyOp.cc"]),
     hdrs = glob(["*.h"]),

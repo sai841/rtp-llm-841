@@ -56,6 +56,7 @@ cc_library(
     copts = copts(),
     deps = [
         "//rtp_llm/models_py/bindings:register_ops_hdr",
+        "//rtp_llm/models_py/bindings/common:write_cache_store_op",
     ],
     visibility = ["//visibility:public"],
     alwayslink = 1,

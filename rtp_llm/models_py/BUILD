@@ -97,10 +97,21 @@ py_library(
 
 py_library(
     name = "kernels",
-    srcs = glob([
-        "kernels/*.py",
-        "kernels/**/*.py",
-    ])
+    srcs = glob(
+        [
+            "kernels/*.py",
+            "kernels/**/*.py",
+        ],
+        exclude = [
+            "kernels/ascend/**/*.py",
+        ],
+    ),
+)
+
+filegroup(
+    name = "qwen3_next_source",
+    srcs = ["model_desc/qwen3_next.py"],
+    visibility = ["//rtp_llm/models_py/kernels/ascend/test:__pkg__"],
 )
 
 py_library(
@@ -124,6 +135,13 @@ py_library(
         ":configs",
         "//rtp_llm/model_loader:loader",
     ] + select({
+        "@//:using_ascend": [
+            "//rtp_llm/models_py/kernels/ascend:qwen3_next_ops",
+        ],
+        "//conditions:default": [
+            "//rtp_llm/models_py/triton_kernels:triton_kernels",
+        ],
+    }) + select({
         "@//:using_cuda12": [
             ":modules_cuda",
         ],
@@ -131,7 +149,8 @@ py_library(
             ":modules_rocm"
         ],
         "@//:using_ascend": [
-            ":modules_ascend"
+            ":modules_ascend",
+            "//rtp_llm/models_py/modules/factory/fused_moe/impl/ascend:ascend_moe",
         ],
         "//conditions:default": [],
     }),

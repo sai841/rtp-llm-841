@@ -64,9 +64,13 @@ elif device_type == DeviceType.Ascend:
 
     from rtp_llm.models_py.modules.factory.fused_moe.impl.ascend.strategy import (
         AscendBf16FallbackStrategy,
+        AscendCannStrategy,
     )
 
     registry = StrategyRegistry()
+    # CANN 专用算子策略优先（BF16 / 纯 TP 条件满足时，含图模式支持），
+    # 其余场景回退 PyTorch 实现。
+    registry.register(AscendCannStrategy())
     registry.register(AscendBf16FallbackStrategy())
     FusedMoeFactory.set_registry(registry)
 

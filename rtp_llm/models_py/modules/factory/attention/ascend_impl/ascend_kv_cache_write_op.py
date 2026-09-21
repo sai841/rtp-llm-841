@@ -1,6 +1,9 @@
 import torch
 import torch_npu
 
+from rtp_llm.models_py.modules.factory.attention.ascend_impl.ascend_attn_params import (
+    split_kv_physical,
+)
 from rtp_llm.ops.compute_ops import LayerKVCache
 
 
@@ -27,10 +30,11 @@ class AscendKVCacheWriteOp:
         if kv_cache is None:
             return
 
-        kv_base = kv_cache.kv_cache_base
-        # Already BSND [blocks, seq, heads, dim] from C++ reshape — no permute
-        k_view = kv_base[:, 0]
-        v_view = kv_base[:, 1]
+        # slot_mapping addresses tokens as physical_block * physical_seq +
+        # offset, so the scatter targets must be the physical K/V views: the
+        # per-layer kernel-block view interleaves K and V when a physical block
+        # is subdivided.
+        k_view, v_view = split_kv_physical(kv_cache, self.params.blocks_per_phys)
 
         slot_mapping = self.params.slot_mapping
         if slot_mapping.dtype not in (torch.int32, torch.int64):

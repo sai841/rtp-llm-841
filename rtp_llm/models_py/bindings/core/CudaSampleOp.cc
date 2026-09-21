@@ -310,21 +310,33 @@ GreedyOutput sampleGreedy(const GreedyParams& params) {
     auto transposed_tokens = device_tokens.transpose(0, 1).contiguous();
 
     // ---- Handle do_sample: save logits for non-sampling (greedy) batches ----
-    bool has_not_do_sample = params.do_sample.has_value() &&
-                             std::any_of(params.do_sample.value().data_ptr<bool>(),
-                                         params.do_sample.value().data_ptr<bool>() + batch_size,
-                                         [](auto t) { return !t; });
+    // temperature <= 0 also means greedy (OpenAI convention: temperature=0 = greedy).
     bool need_do_sample    = (!params.do_sample.has_value()) ||
                               std::any_of(params.do_sample.value().data_ptr<bool>(),
                                          params.do_sample.value().data_ptr<bool>() + batch_size,
                                          [](auto t) { return t; });
+    bool has_temp_greedy   = need_do_sample &&
+                             std::any_of(params.temperature.data_ptr<float>(),
+                                         params.temperature.data_ptr<float>() + batch_size,
+                                         [](auto t) { return t <= 0.0f; });
+    bool has_not_do_sample = (params.do_sample.has_value() &&
+                              std::any_of(params.do_sample.value().data_ptr<bool>(),
+                                          params.do_sample.value().data_ptr<bool>() + batch_size,
+                                          [](auto t) { return !t; })) || has_temp_greedy;
 
     torch::Tensor selected_logits;
-    torch::Tensor mask_tensor;
+    torch::Tensor mask_tensor;  // true = greedy rows (should NOT be sampled/penalized)
     if (has_not_do_sample && need_do_sample) {
-        auto do_sample_npu = params.do_sample.value().to(device_type);
-        mask_tensor        = do_sample_npu.reshape({(int64_t)batch_size, 1}).logical_not();
-        selected_logits    = params.logits.masked_select(mask_tensor);
+        if (params.do_sample.has_value()) {
+            auto do_sample_npu = params.do_sample.value().to(device_type);
+            mask_tensor = do_sample_npu.reshape({(int64_t)batch_size, 1}).logical_not();
+        }
+        if (has_temp_greedy) {
+            auto temp_npu = params.temperature.to(device_type);
+            auto temp_mask = (temp_npu <= 0.0f).reshape({(int64_t)batch_size, 1});
+            mask_tensor = mask_tensor.defined() ? mask_tensor.logical_or(temp_mask) : temp_mask;
+        }
+        selected_logits = params.logits.masked_select(mask_tensor);
     }
 
     // ---- 1. Apply temperature penalty (PyTorch op, torch_npu handles NPU) ----
@@ -332,8 +344,12 @@ GreedyOutput sampleGreedy(const GreedyParams& params) {
         if (std::any_of(params.temperature.data_ptr<float>(),
                         params.temperature.data_ptr<float>() + batch_size,
                         [](auto t) { return t != 1.0f; })) {
-            auto temperature_npu = params.temperature.to(device_type).reshape({(int64_t)batch_size, 1});
-            params.logits.div_(temperature_npu);
+            // temperature == 0 requests greedy decoding but do_sample stays true:
+            // dividing by zero yields inf/NaN and breaks argmax. Treat
+            // non-positive temperatures as 1.0 (no scaling, pure greedy).
+            auto temperature_npu = params.temperature.to(device_type);
+            temperature_npu.masked_fill_(temperature_npu <= 0.0f, 1.0f);
+            params.logits.div_(temperature_npu.reshape({(int64_t)batch_size, 1}));
         }
     }
 
@@ -343,7 +359,7 @@ GreedyOutput sampleGreedy(const GreedyParams& params) {
     }
 
     // ---- 2. Fast path: top_k = 1 for all batches → argmax only ----
-    auto top_k_ptr = reinterpret_cast<uint32_t*>(params.top_k.data_ptr<int32_t>());
+    auto top_k_ptr = params.top_k.data_ptr<int32_t>();  // signed read (top_k=-1 is "no top-k" sentinel)
     if (std::all_of(top_k_ptr, top_k_ptr + batch_size, [](auto t) { return t == 1; }) &&
         !params.output_all_probs.has_value()) {
         auto samples_t = transposed_tokens.slice(0, transposed_tokens.size(0) - 1,
@@ -421,6 +437,20 @@ GreedyOutput sampleGreedy(const GreedyParams& params) {
             }
         }
         auto selected = torch::multinomial(probs_t, 1, /*replacement=*/false, gen).squeeze(-1);
+        // A mixed batch must honour per-request do_sample and temperature=0:
+        // greedy rows (do_sample=false OR temperature<=0) are overwritten with
+        // argmax instead of keeping their random multinomial draw.
+        if (has_not_do_sample) {
+            auto greedy_sel  = torch::argmax(probs_t, -1, /*keepdim=*/false);
+            if (mask_tensor.defined()) {
+                // mask_tensor is true for greedy rows (do_sample=false OR temp<=0)
+                auto sample_mask = mask_tensor.squeeze(-1).logical_not();  // true = sample
+                selected         = torch::where(sample_mask, selected, greedy_sel);
+            } else {
+                // need_do_sample=false: all rows are greedy
+                selected = greedy_sel;
+            }
+        }
         samples_t.copy_(selected);
     }
 
@@ -431,9 +461,12 @@ GreedyOutput sampleGreedy(const GreedyParams& params) {
     // ---- 7. Update cum_log_probs ----
     if (params.cum_log_probs.has_value()) {
         auto cum_log_probs_t = params.cum_log_probs.value();
-        // Use log_softmax on the pre-filtered logits for numerical stability
-        auto log_probs       = torch::log_softmax(params.logits, -1);
-        auto token_log_probs = log_probs.gather(-1, samples_t.reshape({(int64_t)batch_size, 1})).squeeze(-1);
+        // params.logits was overwritten with softmax probs in step 4, so
+        // log_softmax(logits) double-softmaxes and yields wrong values.
+        // Take the probability of the selected token directly from
+        // probs_t and take its log instead.
+        auto token_probs     = probs_t.gather(-1, samples_t.reshape({(int64_t)batch_size, 1})).squeeze(-1);
+        auto token_log_probs = token_probs.clamp_min(1e-10f).log();
         cum_log_probs_t.add_(token_log_probs.to(cum_log_probs_t.device()));
     }
 

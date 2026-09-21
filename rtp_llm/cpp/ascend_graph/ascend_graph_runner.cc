@@ -545,16 +545,38 @@ static void copyTensorSlice(const torch::Tensor& src, torch::Tensor& dst) {
     if (!src.defined() || !dst.defined() || src.numel() <= 0) return;
     RTP_LLM_PROFILE_SCOPE("ascend_graph.copyTensorSlice");
     auto s = src;
-    while (s.dim() > dst.dim() && s.size(0) == 1) {
+    auto d = dst;
+    // Squeeze leading singleton dims until dims match
+    while (s.dim() > d.dim() && s.size(0) == 1) {
         s = s.squeeze(0);
     }
-    if (s.dim() < 2) {
-        dst.slice(0, 0, s.size(0)).copy_(s, /*non_blocking=*/true);
+    while (d.dim() > s.dim() && d.size(0) == 1) {
+        d = d.squeeze(0);
+    }
+    if (s.sizes() == d.sizes()) {
+        d.copy_(s, /*non_blocking=*/true);
         return;
     }
-    int64_t rows = std::min(s.size(0), dst.size(0));
-    int64_t cols = std::min(s.size(1), dst.size(1));
-    dst.slice(0, 0, rows).slice(1, 0, cols).copy_(
+    if (s.dim() < 2) {
+        d.slice(0, 0, s.size(0)).copy_(s, /*non_blocking=*/true);
+        return;
+    }
+    // When src has more dims than dst (e.g. 3D [group, batch, cols] -> 2D [batch, cols]),
+    // select group 0 slice instead of flattening. This mirrors the Python-side
+    // _squeeze_block_table / compute_ascend_attn_params logic and the legacy
+    // field handling in setupKVCacheForAttentionInputs (which also uses group 0).
+    if (s.dim() != d.dim()) {
+        while (s.dim() > d.dim()) {
+            s = s.size(0) == 1 ? s.squeeze(0) : s[0];
+        }
+        if (s.sizes() == d.sizes()) {
+            d.copy_(s, /*non_blocking=*/true);
+            return;
+        }
+    }
+    int64_t rows = std::min(s.size(0), d.size(0));
+    int64_t cols = std::min(s.size(1), d.size(1));
+    d.slice(0, 0, rows).slice(1, 0, cols).copy_(
         s.slice(0, 0, rows).slice(1, 0, cols), /*non_blocking=*/true);
 }
 
@@ -593,9 +615,9 @@ void AscendGraphRunner::prepareInputs(const PyModelInputs& inputs, CudaGraphStat
     if (inputs.input_hiddens.defined() && inputs.input_hiddens.numel() > 0) {
         py_model_inputs.input_hiddens.slice(0, 0, token_num).copy_(inputs.input_hiddens, /*non_blocking=*/true);
     }
-    copyTensorSlice(inputs.attention_inputs.cu_seqlens, py_model_inputs.attention_inputs.cu_seqlens);
+    copyTensorSlice(inputs.attention_inputs.cu_seqlens, py_model_inputs.attention_inputs.cu_seqlens);   
     copyTensorSlice(inputs.attention_inputs.cu_kv_seqlens, py_model_inputs.attention_inputs.cu_kv_seqlens);
-    copyTensorSlice(inputs.attention_inputs.input_lengths_d, py_model_inputs.attention_inputs.input_lengths_d);
+    copyTensorSlice(inputs.attention_inputs.input_lengths_d, py_model_inputs.attention_inputs.input_lengths_d);         
     copyTensorSlice(inputs.attention_inputs.kv_cache_kernel_block_id_device,
                     py_model_inputs.attention_inputs.kv_cache_kernel_block_id_device);
     copyTensorSlice(inputs.attention_inputs.kv_cache_block_id_device,
@@ -641,9 +663,15 @@ void AscendGraphRunner::prepareInputs(const PyModelInputs& inputs, CudaGraphStat
     copyTensorSlice(inputs.attention_inputs.kv_cache_block_id_host,
                     py_model_inputs.attention_inputs.kv_cache_block_id_host);
     if (inputs.attention_inputs.kv_cache_layer_to_group.defined()
-        && inputs.attention_inputs.kv_cache_layer_to_group.numel() > 0) {
-        py_model_inputs.attention_inputs.kv_cache_layer_to_group.copy_(
-            inputs.attention_inputs.kv_cache_layer_to_group);
+        && inputs.attention_inputs.kv_cache_layer_to_group.numel() > 0
+        && py_model_inputs.attention_inputs.kv_cache_layer_to_group.defined()) {
+        auto src = inputs.attention_inputs.kv_cache_layer_to_group;
+        auto dst = py_model_inputs.attention_inputs.kv_cache_layer_to_group;
+        // Reshape src to match dst shape (handle 1D vs 2D mismatch)
+        if (src.sizes() != dst.sizes()) {
+            src = src.reshape(dst.sizes());
+        }
+        dst.copy_(src, /*non_blocking=*/true);
     }
     if (inputs.attention_inputs.sequence_lengths.defined()) {
         auto src = inputs.attention_inputs.sequence_lengths.slice(0, 0, state.current_batch_size);

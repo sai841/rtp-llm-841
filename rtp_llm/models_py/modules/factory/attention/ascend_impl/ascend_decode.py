@@ -4,6 +4,8 @@ import torch_npu
 from rtp_llm.models_py.modules.factory.attention.ascend_impl.ascend_attn_params import (
     AscendAttnParams,
     compute_ascend_attn_params,
+    infer_blocks_per_phys,
+    split_kv_kernel_blocks,
 )
 from rtp_llm.models_py.modules.factory.attention.ascend_impl.ascend_kv_cache_write_op import AscendKVCacheWriteOp
 from rtp_llm.models_py.modules.factory.attention.ascend_impl.ascend_rope_emb import AscendRotaryEmbeddingOp
@@ -14,7 +16,7 @@ from rtp_llm.models_py.modules.factory.attention import common
 class AscendDecodeImpl(FMHAImplBase):
     """Ascend MHA Decode using FIA v2.
 
-    Eager: FIA v2 + .reshape() (contiguous copy).
+    Eager: FIA v2 + split_kv_kernel_blocks (contiguous copy).
     Graph: FIA v2 + graph_task_group + graph_task_update (vllm-ascend pattern).
     """
 
@@ -61,11 +63,18 @@ class AscendDecodeImpl(FMHAImplBase):
         value = v.reshape(v.shape[0], num_kv_heads, head_dim).contiguous()
         return query, key, value
 
-    def _update_rope_kv_write_params(self, device):
+    def _update_rope_kv_write_params(self, device, kv_cache, layer_idx: int = 0):
         if getattr(self.attn_inputs, "is_cuda_graph", False):
             self._update_rope_kv_write_params_device(device)
             return
-        positions, slot_mapping = compute_ascend_attn_params(self.attn_inputs)
+        # The kernel block granularity comes from the per-layer cache view; the
+        # physical block size it maps onto drives slot_mapping and the writes.
+        blocks_per_phys = infer_blocks_per_phys(self.attn_inputs)
+        kernel_page = kv_cache.seq_size_per_block if kv_cache is not None else 0
+        self.params.blocks_per_phys = blocks_per_phys
+        positions, slot_mapping = compute_ascend_attn_params(
+            self.attn_inputs, layer_idx, kernel_page * blocks_per_phys
+        )
         self.params.positions_d = positions.to(device, non_blocking=True)
         self.params.slot_mapping = slot_mapping.to(device, non_blocking=True)
 
@@ -111,7 +120,7 @@ class AscendDecodeImpl(FMHAImplBase):
         is_graph = getattr(self.attn_inputs, "is_cuda_graph", False)
 
         if self.need_rope_kv_cache:
-            self._update_rope_kv_write_params(qkv.device)
+            self._update_rope_kv_write_params(qkv.device, kv_cache, layer_idx)
             if self.rope_impl is not None:
                 query, key, value = self.rope_impl.forward(qkv)
             else:
@@ -167,6 +176,7 @@ class AscendDecodeAttnOp:
                          attn_inputs.kv_cache else 128
         self.block_table = None
         self.context_lens = None
+        self.blocks_per_phys = 1
 
         self._graph_handles = []
         self._graph_refs = []
@@ -185,13 +195,17 @@ class AscendDecodeAttnOp:
             else:
                 self.context_lens = None
             return
+        # Eager path
         self.block_table = attn_inputs.kv_cache_kernel_block_id_host
+        self.blocks_per_phys = infer_blocks_per_phys(attn_inputs)
         if self.block_table is not None:
             self.block_table = self.block_table.clamp(min=0)
             if self.block_table.ndim != 2:
                 self.block_table = self.block_table.reshape(-1, self.block_table.shape[-1])
         if attn_inputs.sequence_lengths.numel() > 0:
             self.context_lens = attn_inputs.sequence_lengths + 1
+        elif attn_inputs.prefix_lengths.numel() > 0 and attn_inputs.input_lengths.numel() > 0:
+            self.context_lens = attn_inputs.prefix_lengths + attn_inputs.input_lengths
         else:
             self.context_lens = None
 
@@ -295,22 +309,28 @@ class AscendDecodeAttnOp:
         us.synchronize()
 
     def _forward_fia(self, q, kv_cache, block_table, context_lens):
-        kv_base = kv_cache.kv_cache_base
-        k_cache = kv_base[:, 0].reshape(kv_base.shape[0], self.page_size, -1)
-        v_cache = kv_base[:, 1].reshape(kv_base.shape[0], self.page_size, -1)
+        # Eager path: split K/V at kernel-block granularity
+        k_cache, v_cache, page_size = split_kv_kernel_blocks(
+            kv_cache, self.blocks_per_phys)
         batch_size = q.shape[0]
-        actual_seq_q = torch.arange(1, batch_size + 1, dtype=torch.int32, device=q.device)
+        actual_seq_q = torch.arange(
+            1, batch_size + 1, dtype=torch.int32, device=q.device
+        )
         actual_seq_kv = context_lens.to(torch.int32)
         if actual_seq_kv.device.type != q.device.type:
             actual_seq_kv = actual_seq_kv.to(q.device)
         atten_mask = self._get_causal_mask(q.device)
         attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
             query=q, key=k_cache, value=v_cache,
-            atten_mask=atten_mask, block_table=block_table,
-            input_layout="TND", block_size=self.page_size,
-            actual_seq_qlen=actual_seq_q, actual_seq_kvlen=actual_seq_kv,
+            atten_mask=atten_mask,
+            block_table=block_table,
+            input_layout="TND",
+            block_size=page_size,
+            actual_seq_qlen=actual_seq_q,
+            actual_seq_kvlen=actual_seq_kv,
             num_key_value_heads=self.num_kv_heads,
             num_query_heads=self.num_heads,
-            softmax_scale=self.scale, sparse_mode=3,
+            softmax_scale=self.scale,
+            sparse_mode=3,
         )
         return attn_output
